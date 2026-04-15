@@ -1,0 +1,411 @@
+"""
+Scheduled Discovery — APScheduler based
+Endpoints: CRUD for subnet_schedules
+Scheduler: loaded on startup via lifespan in main.py
+"""
+
+import asyncio
+from datetime import datetime, timezone
+from typing import Optional, List
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import text as sa_text, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..database import get_db, AsyncSessionLocal
+from ..models.models import Subnet, ActivityLog
+from ..auth import require_admin, require_editor, require_viewer
+
+router = APIRouter(prefix="/schedules", tags=["Schedules"])
+
+# ── Schemas ──────────────────────────────────────────────────────
+
+class ScheduleBase(BaseModel):
+    task_name:   str            = ""
+    subnet_id:   Optional[UUID] = None
+    frequency:   str            = "none"
+    run_time:    str            = "02:00"
+    day_of_week: int            = 0
+    method:      str            = "auto"
+    is_active:   bool           = True
+
+class ScheduleCreate(ScheduleBase):
+    pass
+
+class ScheduleUpdate(BaseModel):
+    frequency:   Optional[str]  = None
+    run_time:    Optional[str]  = None
+    day_of_week: Optional[int]  = None
+    method:      Optional[str]  = None
+    is_active:   Optional[bool] = None
+
+class ScheduleOut(ScheduleBase):
+    id:          UUID
+    task_name:   str = ""
+    last_run_at: Optional[datetime] = None
+    next_run_at: Optional[datetime] = None
+    created_at:  datetime
+    subnet_name: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+# ── Helpers ──────────────────────────────────────────────────────
+
+DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+def next_run_time(frequency: str, run_time: str, day_of_week: int) -> Optional[datetime]:
+    """Calculate next run datetime from schedule params using local timezone"""
+    if frequency == "none":
+        return None
+    from datetime import timedelta
+
+    now  = datetime.now()  # local time — respects TZ env var
+    h, m = map(int, run_time.split(":"))
+
+    if frequency == "daily":
+        candidate = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        return candidate
+
+    if frequency == "weekly":
+        today      = now.weekday()
+        days_ahead = (day_of_week - today) % 7
+        candidate  = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        candidate  += timedelta(days=days_ahead)
+        if candidate <= now:
+            candidate += timedelta(weeks=1)
+        return candidate
+
+    return None
+
+
+# ── Trigger a discovery run ───────────────────────────────────────
+
+async def trigger_scheduled_discovery(schedule_id: str, subnet_id: Optional[str], method: str,
+                                       frequency: str = 'daily', run_time: str = '02:00',
+                                       day_of_week: int = 0):
+    """Called by APScheduler — runs discovery for scheduled subnet"""
+    async with AsyncSessionLocal() as db:
+        try:
+            # Determine which subnets to scan
+            if subnet_id:
+                result  = await db.execute(
+                    select(Subnet).where(sa_text(f"id::text = '{subnet_id}'"))
+                )
+                subnets = result.scalars().all()
+            else:
+                # Global — scan all active subnets
+                result  = await db.execute(select(Subnet))
+                subnets = result.scalars().all()
+
+            if not subnets:
+                return
+
+            subnet_ids = [s.id for s in subnets]
+
+            # Create activity log entry
+            job = ActivityLog(
+                job_type   = "discovery",
+                status     = "running",
+                started_by = "scheduler",
+                filename   = f"Scheduled — {len(subnets)} subnet(s)",
+                summary    = f"Scheduled discovery starting for {', '.join(s.name for s in subnets)}",
+            )
+            db.add(job)
+            await db.flush()
+            await db.refresh(job)
+            await db.commit()
+
+            # Update last_run_at
+            await db.execute(
+                sa_text("UPDATE subnet_schedules SET last_run_at = NOW(), updated_at = NOW() WHERE id::text = :sid"),
+                {"sid": schedule_id}
+            )
+            await db.commit()
+
+            # Decide method
+            actual_method = method
+            if method == "auto":
+                # Check if any linked gateway exists
+                gw_check = await db.execute(
+                    sa_text("SELECT COUNT(*) FROM gateway_subnets gs "
+                            "JOIN gateways g ON g.id = gs.gateway_id "
+                            "WHERE g.is_active = true AND gs.subnet_id = ANY(:sids)"),
+                    {"sids": [str(s) for s in subnet_ids]}
+                )
+                count = gw_check.scalar()
+                actual_method = "arp" if count > 0 else "tcp"
+
+            # Import and run discovery
+            if actual_method == "tcp":
+                from ..routes.discovery import run_discovery
+                await run_discovery(
+                    job_id     = job.id,
+                    subnet_ids = subnet_ids,
+                    username   = "scheduler",
+                    timeout    = 1.0,
+                    snmp_community = None,
+                    use_snmp_arp   = False,
+                )
+            else:
+                # ARP — find first active gateway linked to any of these subnets
+                gw_res = await db.execute(
+                    sa_text("SELECT gs.gateway_id FROM gateway_subnets gs "
+                            "JOIN gateways g ON g.id = gs.gateway_id "
+                            "WHERE g.is_active = true LIMIT 1")
+                )
+                gw_row = gw_res.fetchone()
+                if gw_row:
+                    from ..routes.discovery import run_arp_sweep
+                    await run_arp_sweep(
+                        job_id     = job.id,
+                        gateway_id = gw_row[0],
+                        subnet_ids = subnet_ids,
+                        username   = "scheduler",
+                    )
+                else:
+                    from ..routes.discovery import run_discovery
+                    await run_discovery(
+                        job_id     = job.id,
+                        subnet_ids = subnet_ids,
+                        username   = "scheduler",
+                        timeout    = 1.0,
+                        snmp_community = None,
+                        use_snmp_arp   = False,
+                    )
+
+            # After job finishes — check final status & preserve error if stopped
+            async with AsyncSessionLocal() as db2:
+                job_res = await db2.execute(select(ActivityLog).where(ActivityLog.id == job.id))
+                final_job = job_res.scalar_one_or_none()
+                if final_job and final_job.summary and 'Stopped by user' in (final_job.summary or ''):
+                    final_job.status = 'error'  # keep error status if stopped
+                    await db2.commit()
+
+            # Update next_run_at for this schedule
+            next_run = next_run_time(frequency, run_time, day_of_week)
+            async with AsyncSessionLocal() as db3:
+                await db3.execute(
+                    sa_text("UPDATE subnet_schedules SET next_run_at = :next_run, updated_at = NOW() "
+                            "WHERE id::text = :sid"),
+                    {"next_run": next_run, "sid": schedule_id}
+                )
+                await db3.commit()
+
+        except Exception as e:
+            print(f"[Scheduler] Error: {e}")
+
+
+# ── APScheduler setup ────────────────────────────────────────────
+
+def get_scheduler():
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    return AsyncIOScheduler()
+
+_scheduler = None
+
+async def start_scheduler():
+    """Load all active schedules from DB and start APScheduler"""
+    global _scheduler
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+
+    _scheduler = AsyncIOScheduler()
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            sa_text("SELECT id::text, subnet_id::text, frequency, run_time, day_of_week, method "
+                    "FROM subnet_schedules WHERE is_active = true AND frequency != 'none'")
+        )
+        schedules = result.fetchall()
+
+    for row in schedules:
+        sid, subnet_id, frequency, run_time, dow, method = row
+        h, m = map(int, run_time.split(":"))
+
+        if frequency == "daily":
+            trigger = CronTrigger(hour=h, minute=m)
+        elif frequency == "weekly":
+            trigger = CronTrigger(day_of_week=dow, hour=h, minute=m)
+        else:
+            continue
+
+        _scheduler.add_job(
+            trigger_scheduled_discovery,
+            trigger,
+            args=[sid, subnet_id, method, frequency, run_time, dow],
+            id=f"schedule_{sid}",
+            replace_existing=True,
+        )
+        print(f"[Scheduler] Loaded schedule {sid} — {frequency} at {run_time}")
+
+    _scheduler.start()
+    print(f"[Scheduler] Started with {len(schedules)} active schedules")
+
+def reload_job(schedule_id: str, subnet_id: Optional[str], frequency: str,
+               run_time: str, day_of_week: int, method: str, is_active: bool):
+    """Add/update/remove a job in the running scheduler"""
+    global _scheduler
+    if not _scheduler:
+        return
+
+    from apscheduler.triggers.cron import CronTrigger
+    job_id = f"schedule_{schedule_id}"
+
+    # Remove existing
+    try:
+        _scheduler.remove_job(job_id)
+    except Exception:
+        pass
+
+    if not is_active or frequency == "none":
+        return
+
+    h, m = map(int, run_time.split(":"))
+    if frequency == "daily":
+        trigger = CronTrigger(hour=h, minute=m)
+    elif frequency == "weekly":
+        trigger = CronTrigger(day_of_week=day_of_week, hour=h, minute=m)
+    else:
+        return
+
+    _scheduler.add_job(
+        trigger_scheduled_discovery,
+        trigger,
+        args=[schedule_id, subnet_id, method, frequency, run_time, day_of_week],
+        id=job_id,
+        replace_existing=True,
+    )
+
+
+# ── CRUD Endpoints ────────────────────────────────────────────────
+
+@router.get("", response_model=List[ScheduleOut])
+async def list_schedules(
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_viewer),
+):
+    result = await db.execute(
+        sa_text("""
+            SELECT ss.id::text, ss.subnet_id::text, ss.frequency, ss.run_time,
+                   ss.day_of_week, ss.method, ss.is_active,
+                   ss.last_run_at, ss.next_run_at, ss.created_at,
+                   s.name as subnet_name, COALESCE(ss.task_name, '') as task_name
+            FROM subnet_schedules ss
+            LEFT JOIN subnets s ON s.id = ss.subnet_id
+            ORDER BY ss.created_at DESC
+        """)
+    )
+    rows = result.fetchall()
+    return [ScheduleOut(
+        id          = r[0],
+        subnet_id   = r[1],
+        frequency   = r[2],
+        run_time    = r[3],
+        day_of_week = r[4],
+        method      = r[5],
+        is_active   = r[6],
+        last_run_at = r[7],
+        next_run_at = r[8],
+        created_at  = r[9],
+        subnet_name = r[10],
+        task_name   = r[11] or '',
+    ) for r in rows]
+
+
+@router.get("/subnet/{subnet_id}", response_model=Optional[ScheduleOut])
+async def get_subnet_schedule(
+    subnet_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_viewer),
+):
+    result = await db.execute(
+        sa_text("SELECT id::text, subnet_id::text, frequency, run_time, day_of_week, "
+                "method, is_active, last_run_at, next_run_at, created_at "
+                "FROM subnet_schedules WHERE subnet_id::text = :sid"),
+        {"sid": str(subnet_id)}
+    )
+    row = result.fetchone()
+    if not row:
+        return None
+    return ScheduleOut(
+        id=row[0], subnet_id=row[1], frequency=row[2], run_time=row[3],
+        day_of_week=row[4], method=row[5], is_active=row[6],
+        last_run_at=row[7], next_run_at=row[8], created_at=row[9],
+    )
+
+
+@router.post("", response_model=ScheduleOut, status_code=201)
+async def create_or_update_schedule(
+    payload: ScheduleCreate,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    subnet_id_str = str(payload.subnet_id) if payload.subnet_id else None
+    next_run = next_run_time(payload.frequency, payload.run_time, payload.day_of_week)
+
+    # Upsert — conflict on task_name + subnet_id combination
+    result = await db.execute(
+        sa_text("""
+            INSERT INTO subnet_schedules
+              (task_name, subnet_id, frequency, run_time, day_of_week, method, is_active, next_run_at)
+            VALUES (:task_name, :sid, :freq, :rt, :dow, :method, :active, :next_run)
+            ON CONFLICT (task_name, subnet_id) DO UPDATE SET
+              frequency   = EXCLUDED.frequency,
+              run_time    = EXCLUDED.run_time,
+              day_of_week = EXCLUDED.day_of_week,
+              method      = EXCLUDED.method,
+              is_active   = EXCLUDED.is_active,
+              next_run_at = EXCLUDED.next_run_at,
+              updated_at  = NOW()
+            RETURNING id::text, subnet_id::text, frequency, run_time, day_of_week,
+                      method, is_active, last_run_at, next_run_at, created_at, task_name
+        """),
+        {
+            "task_name": payload.task_name or '',
+            "sid":       subnet_id_str,
+            "freq":      payload.frequency,
+            "rt":        payload.run_time,
+            "dow":       payload.day_of_week,
+            "method":    payload.method,
+            "active":    payload.is_active,
+            "next_run":  next_run,
+        }
+    )
+    await db.commit()
+    row = result.fetchone()
+
+    # Update scheduler
+    reload_job(row[0], row[1], row[2], row[3], row[4], row[5], row[6])
+
+    return ScheduleOut(
+        id=row[0], subnet_id=row[1], frequency=row[2], run_time=row[3],
+        day_of_week=row[4], method=row[5], is_active=row[6],
+        last_run_at=row[7], next_run_at=row[8], created_at=row[9],
+        task_name=row[10] or '',
+    )
+
+
+@router.delete("/{schedule_id}", status_code=204)
+async def delete_schedule(
+    schedule_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    await db.execute(
+        sa_text("DELETE FROM subnet_schedules WHERE id = :id"),
+        {"id": str(schedule_id)}
+    )
+    await db.commit()
+
+    # Remove from scheduler
+    global _scheduler
+    if _scheduler:
+        try:
+            _scheduler.remove_job(f"schedule_{schedule_id}")
+        except Exception:
+            pass

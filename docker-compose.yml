@@ -1,0 +1,54 @@
+# Windows Development
+
+name: ipcontrol_demo
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: ipam_db_demo
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-ipam}
+      POSTGRES_USER:     ${POSTGRES_USER:-ipam_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ipam_pass}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ipam_user} -d ${POSTGRES_DB:-ipam}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    container_name: ipam_backend_demo
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ipam_user}:${POSTGRES_PASSWORD:-ipam_pass}@db:5432/${POSTGRES_DB:-ipam}
+      SECRET_KEY: ${SECRET_KEY:-change-this-in-production}
+      TZ: Asia/Kolkata
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      - nginx_logs:/var/log/nginx:ro
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    container_name: ipam_frontend_demo
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+    volumes:
+      - nginx_logs:/var/log/nginx
+
+volumes:
+  postgres_data:
+  nginx_logs:

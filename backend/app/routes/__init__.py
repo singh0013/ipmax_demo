@@ -1,0 +1,11 @@
+from .subnets   import router as subnets_router
+from .ips       import router as ips_router
+from .dashboard import router as dashboard_router
+from .audit     import router as audit_router
+from .imports   import router as imports_router
+from .auth      import router as auth_router
+from .users     import router as users_router
+from .discovery import router as discovery_router
+from .gateways  import router as gateways_router
+from .tasks     import router as tasks_router
+from .support   import router as support_router

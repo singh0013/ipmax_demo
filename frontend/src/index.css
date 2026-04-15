@@ -1,0 +1,78 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; }
+
+  body {
+    background: #0f1117;
+    color: #e2e8f0;
+    font-family: 'DM Sans', sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::-webkit-scrollbar        { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track  { background: #0f1117; }
+  ::-webkit-scrollbar-thumb  { background: #1e2736; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #2a3548; }
+}
+
+@layer components {
+  .card {
+    background-color: #161b25;
+    border: 1px solid #1e2736;
+    border-radius: 0.75rem;
+  }
+
+  .btn-primary {
+    @apply flex items-center gap-2 px-4 py-2 text-white text-sm font-medium rounded-lg transition-colors duration-150;
+    background-color: #17b584;
+  }
+  .btn-primary:hover { background-color: #3dcfa0; }
+
+  .btn-secondary {
+    @apply flex items-center gap-2 px-4 py-2 text-slate-300 text-sm font-medium rounded-lg transition-colors duration-150;
+    background-color: #1a2133;
+    border: 1px solid #1e2736;
+  }
+  .btn-secondary:hover { background-color: #1e2736; }
+
+  .btn-danger {
+    @apply flex items-center gap-2 px-4 py-2 text-red-400 text-sm font-medium rounded-lg transition-colors duration-150;
+    background-color: rgba(239,68,68,0.10);
+    border: 1px solid rgba(239,68,68,0.20);
+  }
+  .btn-danger:hover { background-color: rgba(239,68,68,0.20); }
+
+  .input {
+    @apply w-full rounded-lg px-3 py-2 text-sm text-slate-200 placeholder-slate-500 transition-colors duration-150;
+    background-color: #0f1117;
+    border: 1px solid #1e2736;
+    outline: none;
+  }
+  .input:focus {
+    border-color: #17b584;
+    box-shadow: 0 0 0 3px rgba(23,181,132,0.15);
+  }
+
+  .label {
+    @apply block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wide;
+  }
+
+  .status-used       { @apply bg-emerald-500/10 text-emerald-400 border border-emerald-500/30; }
+  .status-free       { @apply bg-blue-500/10 text-blue-400 border border-blue-500/30; }
+  .status-reserved   { @apply bg-amber-500/10 text-amber-400 border border-amber-500/30; }
+  .status-deprecated { @apply bg-slate-500/10 text-slate-400 border border-slate-500/30; }
+  .status-used-dhcp  { @apply bg-purple-500/10 text-purple-400 border border-purple-500/30; }
+  .status-discovered { @apply bg-cyan-500/10 text-cyan-400 border border-cyan-500/30; }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.2s ease-out forwards;
+}

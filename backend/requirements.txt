@@ -1,0 +1,34 @@
+# Web framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# Database
+sqlalchemy==2.0.35
+asyncpg==0.29.0
+
+# Data validation
+pydantic==2.9.2
+pydantic-settings==2.5.2
+python-dotenv==1.0.1
+
+# Auth — IMPORTANT: use bcrypt directly, do NOT add passlib (incompatible with bcrypt>=4)
+python-jose[cryptography]==3.3.0
+bcrypt==4.0.1
+
+# File upload (required for CSV import endpoints)
+python-multipart==0.0.12
+
+# Discovery engine
+dnspython==2.6.1
+
+# Scheduler
+apscheduler==3.10.4
+
+# Gateway password encryption
+cryptography==43.0.1
+
+# Docker SDK — for fetching container logs in Support page
+docker==7.1.0
+
+# SSH for ARP sweep
+paramiko==3.4.0

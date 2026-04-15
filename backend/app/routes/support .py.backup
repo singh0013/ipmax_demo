@@ -1,0 +1,434 @@
+"""
+Support routes — Logs download, DB backup/restore
+Admin only endpoints
+"""
+
+import io
+import os
+import json
+import zipfile
+import subprocess
+import tempfile
+from datetime import datetime, timezone
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi.responses import StreamingResponse, JSONResponse
+from sqlalchemy import text as sa_text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..database import get_db, AsyncSessionLocal
+from ..auth import require_admin
+
+router = APIRouter(prefix="/support", tags=["Support"])
+
+
+# ── Helpers ──────────────────────────────────────────────────────
+
+def _get_backend_logs() -> str:
+    """Get backend logs from uvicorn process output"""
+    # We are inside the container — read from stderr/stdout via /proc
+    try:
+        # Try reading from proc fd (uvicorn writes to fd 1/2)
+        import glob
+        for path in ["/proc/1/fd/1", "/proc/1/fd/2"]:
+            try:
+                with open(path, 'r', errors='replace') as f:
+                    content = f.read(500000)  # max 500KB
+                if content:
+                    return content
+            except Exception:
+                continue
+        return "[Backend logs not accessible from container]"
+    except Exception as e:
+        return f"[Error: {e}]"
+
+
+def _get_nginx_logs() -> str:
+    """Read nginx logs from volume mounted path"""
+    lines = []
+    for log_file in ["/var/log/nginx/access.log", "/var/log/nginx/error.log"]:
+        try:
+            if os.path.exists(log_file):
+                with open(log_file, "r", errors="replace") as f:
+                    content = f.read()
+                lines.append(f"=== {log_file} ===\n{content}")
+            else:
+                lines.append(f"=== {log_file} === [not found — check volume mount]")
+        except Exception as e:
+            lines.append(f"=== {log_file} === [Error: {e}]")
+    return "\n\n".join(lines) or "[No nginx logs found]"
+
+
+async def _get_activity_logs_json(db: AsyncSession) -> str:
+    """Export all activity logs as JSON"""
+    result = await db.execute(
+        sa_text("""
+            SELECT id::text, job_type, status, started_by, filename,
+                   total, processed, succeeded, failed, summary,
+                   logs, started_at, finished_at
+            FROM activity_log
+            ORDER BY started_at DESC
+            LIMIT 500
+        """)
+    )
+    rows = result.fetchall()
+    data = []
+    for r in rows:
+        data.append({
+            "id":          r[0],
+            "job_type":    r[1],
+            "status":      r[2],
+            "started_by":  r[3],
+            "filename":    r[4],
+            "total":       r[5],
+            "processed":   r[6],
+            "succeeded":   r[7],
+            "failed":      r[8],
+            "summary":     r[9],
+            "logs":        r[10] or [],
+            "started_at":  r[11].isoformat() if r[11] else None,
+            "finished_at": r[12].isoformat() if r[12] else None,
+        })
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+async def _get_audit_logs_json(db: AsyncSession) -> str:
+    """Export audit logs as JSON"""
+    result = await db.execute(
+        sa_text("""
+            SELECT id::text, table_name, record_id::text, action,
+                   changed_by, old_data, new_data, created_at
+            FROM audit_log
+            ORDER BY created_at DESC
+            LIMIT 1000
+        """)
+    )
+    rows = result.fetchall()
+    data = []
+    for r in rows:
+        data.append({
+            "id":         r[0],
+            "table_name": r[1],
+            "record_id":  r[2],
+            "action":     r[3],
+            "changed_by": r[4],
+            "old_data":   r[5],
+            "new_data":   r[6],
+            "created_at": r[7].isoformat() if r[7] else None,
+        })
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+async def _get_system_info(db: AsyncSession) -> str:
+    """Collect system info — version, DB stats, etc."""
+    lines = []
+    lines.append("=" * 50)
+    lines.append("IPMAX — System Information")
+    lines.append(f"Generated: {datetime.now(timezone.utc).isoformat()}")
+    lines.append("=" * 50)
+    lines.append("")
+
+    # DB stats
+    try:
+        stats_queries = [
+            ("Total Subnets",    "SELECT COUNT(*) FROM subnets"),
+            ("Total IPs",        "SELECT COUNT(*) FROM ip_addresses"),
+            ("Used IPs",         "SELECT COUNT(*) FROM ip_addresses WHERE status = 'used'"),
+            ("Free IPs",         "SELECT COUNT(*) FROM ip_addresses WHERE status = 'free'"),
+            ("Total Users",      "SELECT COUNT(*) FROM users"),
+            ("Total Activities", "SELECT COUNT(*) FROM activity_log"),
+            ("Total Gateways",   "SELECT COUNT(*) FROM gateways"),
+            ("Total Tasks",      "SELECT COUNT(DISTINCT task_name) FROM subnet_schedules WHERE subnet_id IS NOT NULL"),
+        ]
+        lines.append("--- Database Stats ---")
+        for label, query in stats_queries:
+            try:
+                result = await db.execute(sa_text(query))
+                count = result.scalar()
+                lines.append(f"{label:<25}: {count}")
+            except Exception:
+                lines.append(f"{label:<25}: N/A")
+
+        lines.append("")
+        lines.append("--- Recent Activity ---")
+        recent = await db.execute(
+            sa_text("SELECT job_type, status, started_by, started_at FROM activity_log ORDER BY started_at DESC LIMIT 10")
+        )
+        for r in recent.fetchall():
+            lines.append(f"  {r[3].strftime('%Y-%m-%d %H:%M')} | {r[0]:<20} | {r[1]:<10} | {r[2]}")
+
+    except Exception as e:
+        lines.append(f"[Error collecting stats: {e}]")
+
+    lines.append("")
+    lines.append("--- Environment ---")
+    lines.append(f"Python:    {os.sys.version}")
+    lines.append(f"TZ:        {os.environ.get('TZ', 'UTC')}")
+    lines.append(f"SECRET_KEY: {'set' if os.environ.get('SECRET_KEY') else 'NOT SET'}")
+
+    return "\n".join(lines)
+
+
+def _get_db_config():
+    """Parse DB config from DATABASE_URL env var"""
+    db_url = os.environ.get("DATABASE_URL", "postgresql://ipam_user:ipam_pass@db:5432/ipam")
+    # postgresql://user:pass@host:port/dbname
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(db_url)
+        return {
+            "host":     parsed.hostname or "db",
+            "port":     str(parsed.port or 5432),
+            "user":     parsed.username or "ipam_user",
+            "password": parsed.password or "ipam_pass",
+            "dbname":   parsed.path.lstrip("/") or "ipam",
+        }
+    except Exception:
+        return {"host": "db", "port": "5432", "user": "ipam_user",
+                "password": "ipam_pass", "dbname": "ipam"}
+
+@router.get("/logs/download")
+async def download_logs(
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Download all logs as a ZIP file"""
+    from fastapi.responses import Response
+    date_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+
+    # Only DB logs — no blocking file/process reads
+    activity_json = await _get_activity_logs_json(db)
+    audit_json    = await _get_audit_logs_json(db)
+    sys_info      = await _get_system_info(db)
+
+    # Build ZIP in memory
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("activity_log.json",  activity_json)
+        zf.writestr("audit_log.json",     audit_json)
+        zf.writestr("system_info.txt",    sys_info)
+        if restore_jobs:
+            zf.writestr("restore_history.json",
+                        json.dumps(restore_jobs, indent=2, default=str))
+
+    filename = f"ipmax_logs_{date_str}.zip"
+    return Response(
+        content=zip_buffer.getvalue(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
+
+# ── DB Backup ─────────────────────────────────────────────────────
+
+@router.post("/backup/download")
+async def download_backup(
+    _=Depends(require_admin),
+):
+    """Run pg_dump and return .sql file"""
+    date_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    filename = f"ipmax_backup_{date_str}.sql"
+
+    try:
+        cfg = _get_db_config()
+        result = subprocess.run(
+            [
+                "pg_dump",
+                "--host",     cfg["host"],
+                "--port",     cfg["port"],
+                "--username", cfg["user"],
+                "--dbname",   cfg["dbname"],
+                "--no-password",
+                "--format", "plain",
+                "--encoding", "UTF8",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=120,
+            env={**os.environ, "PGPASSWORD": cfg["password"]},
+        )
+
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"pg_dump failed: {result.stderr}")
+
+        sql_content = result.stdout
+        sql_buffer  = io.BytesIO(sql_content.encode("utf-8"))
+
+        return StreamingResponse(
+            sql_buffer,
+            media_type="application/sql",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=500, detail="pg_dump timed out")
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="pg_dump not found in container")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── DB Restore (Async) ───────────────────────────────────────────
+
+# In-memory restore job store
+restore_jobs: dict = {}
+
+async def _run_restore(job_id: str, tmp_path: str, filename: str):
+    """Background task — drop DB, recreate, then restore from backup"""
+
+    def update(msg, status="running"):
+        job = restore_jobs.get(job_id, {})
+        steps = job.get("steps", [])
+        if not steps or steps[-1] != msg:
+            steps.append(msg)
+        restore_jobs[job_id] = {
+            "status":   status,
+            "message":  msg,
+            "steps":    steps,
+            "filename": filename,
+        }
+
+    update("Step 1/4: Terminating active connections...")
+    try:
+        cfg = _get_db_config()
+        env = {**os.environ, "PGPASSWORD": cfg["password"]}
+        loop = __import__('asyncio').get_event_loop()
+
+        def _run(cmd):
+            return subprocess.run(
+                cmd, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, timeout=600,
+            )
+
+        # Step 1
+        await loop.run_in_executor(None, lambda: _run([
+            "psql", "--host", cfg["host"], "--port", cfg["port"],
+            "--username", cfg["user"], "--dbname", "postgres", "--no-password",
+            "-c", f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='{cfg['dbname']}' AND pid <> pg_backend_pid();"
+        ]))
+
+        # Step 2
+        update("Step 2/4: Dropping existing database...")
+        drop = await loop.run_in_executor(None, lambda: _run([
+            "psql", "--host", cfg["host"], "--port", cfg["port"],
+            "--username", cfg["user"], "--dbname", "postgres", "--no-password",
+            "-c", f"DROP DATABASE IF EXISTS {cfg['dbname']};"
+        ]))
+        if drop.returncode != 0:
+            raise RuntimeError(f"Drop failed: {drop.stderr[:200]}")
+
+        # Step 3
+        update("Step 3/4: Creating fresh database...")
+        create = await loop.run_in_executor(None, lambda: _run([
+            "psql", "--host", cfg["host"], "--port", cfg["port"],
+            "--username", cfg["user"], "--dbname", "postgres", "--no-password",
+            "-c", f"CREATE DATABASE {cfg['dbname']} OWNER {cfg['user']};"
+        ]))
+        if create.returncode != 0:
+            raise RuntimeError(f"Create failed: {create.stderr[:200]}")
+
+        # Step 4
+        update(f"Step 4/4: Restoring from {filename}...")
+        result = await loop.run_in_executor(None, lambda: _run([
+            "psql", "--host", cfg["host"], "--port", cfg["port"],
+            "--username", cfg["user"], "--dbname", cfg["dbname"], "--no-password",
+            "-f", tmp_path,
+        ]))
+        if result.returncode != 0:
+            raise RuntimeError(f"Restore failed: {result.stderr[:300]}")
+
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+        update("✅ Database restored successfully! Please refresh the page.", "completed")
+
+    except Exception as e:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        job = restore_jobs.get(job_id, {})
+        steps = job.get("steps", [])
+        steps.append(f"❌ Error: {str(e)}")
+        restore_jobs[job_id] = {
+            "status":   "error",
+            "message":  str(e),
+            "steps":    steps,
+            "filename": filename,
+        }
+
+
+@router.post("/backup/restore")
+async def restore_backup(
+    background_tasks: __import__('fastapi').BackgroundTasks,
+    file: UploadFile = File(...),
+    _=Depends(require_admin),
+):
+    """Upload .sql file — starts async restore, returns job_id immediately"""
+    if not file.filename.endswith(".sql"):
+        raise HTTPException(status_code=400, detail="Only .sql files are allowed")
+
+    content = await file.read()
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    # Write to temp file
+    with tempfile.NamedTemporaryFile(suffix=".sql", delete=False, mode="wb") as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    # Generate job ID
+    import uuid
+    job_id = str(uuid.uuid4())
+
+    # Start background restore
+    background_tasks.add_task(_run_restore, job_id, tmp_path, file.filename)
+
+    return {
+        "job_id":   job_id,
+        "status":   "running",
+        "message":  f"Restore started for {file.filename}",
+        "filename": file.filename,
+    }
+
+
+@router.get("/backup/restore/{job_id}")
+async def restore_status(
+    job_id: str,
+    _=Depends(require_admin),
+):
+    """Poll restore job status"""
+    job = restore_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+# ── Status check ─────────────────────────────────────────────────
+
+@router.get("/status")
+async def support_status(
+    db: AsyncSession = Depends(get_db),
+    _=Depends(require_admin),
+):
+    """Quick health check for support page"""
+    try:
+        await db.execute(sa_text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        db_ok = False
+
+    pg_dump_ok = subprocess.run(["which", "pg_dump"],
+                                 stdout=subprocess.PIPE).returncode == 0
+
+    return {
+        "db_connected":  db_ok,
+        "pg_dump_available": pg_dump_ok,
+        "tz": os.environ.get("TZ", "UTC"),
+        "version": "0.4.0",
+    }
