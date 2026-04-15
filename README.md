@@ -19,7 +19,8 @@ IPMAX is an internal network management tool built for corporate IT/network team
 
 ## Screenshots
 
-> ![Dashboard](screenshots/dashboard.png)
+> <img width="1350" height="609" alt="dashboard" src="https://github.com/user-attachments/assets/fb50a548-372f-4f40-83f2-78958bfef428" />
+
 
 ---
 
