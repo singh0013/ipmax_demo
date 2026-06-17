@@ -179,7 +179,7 @@ This repository contains the **Demo Version** of IPMAX.
 
 ```powershell
 # 1. Clone the repository
-git clone https://github.com/your-username/ipmax.git
+git clone https://github.com/singh0013/ipmax.git
 cd ipmax
 
 # 2. Start the application
@@ -209,7 +209,7 @@ sudo usermod -aG docker $USER
 newgrp docker
 
 # 2. Clone the repository
-git clone https://github.com/your-username/ipmax.git
+git clone https://github.com/singh0013/ipmax.git
 cd ipmax
 
 # 3. Start the application
