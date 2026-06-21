@@ -179,13 +179,23 @@ This repository contains the **Demo Version** of IPMAX.
 
 ```powershell
 # 1. Clone the repository
-git clone https://github.com/singh0013/ipmax.git
+git clone https://github.com/singh0013/ipmax_demo.git
 cd ipmax
 
-# 2. Start the application
+# 2. Configure environment variables
+copy .env.example .env
+
+# Open .env in a text editor and set:
+#   POSTGRES_PASSWORD   → choose your own strong password
+#   SECRET_KEY    → generate a random key (PowerShell):
+#                   -join ((48..57)+(97..102)|Get-Random -Count 64|%{[char]$_})
+#
+# ⚠️ Never leave these as default values — especially in production.
+
+# 3. Start the application
 docker compose up -d --build
 
-# 3. Check all containers are running
+# 4. Check all containers are running
 docker compose ps
 ```
 
@@ -209,16 +219,25 @@ sudo usermod -aG docker $USER
 newgrp docker
 
 # 2. Clone the repository
-git clone https://github.com/singh0013/ipmax.git
+git clone https://github.com/singh0013/ipmax_demo.git
 cd ipmax
 
-# 3. Start the application
+# 3. Configure environment variables
+cp .env.example .env
+
+# Edit .env and set:
+#   POSTGRES_PASSWORD   → choose your own strong password
+#   SECRET_KEY    → generate a random key:
+#                   openssl rand -hex 32
+#
+# ⚠️ Never leave these as default values — especially in production.
+
+# 4. Start the application
 docker compose up -d --build
 
-# 4. Check all containers are running
+# 5. Check all containers are running
 docker compose ps
 ```
-
 **Access:** Open `http://your-server-ip` in your browser.
 
 ---
